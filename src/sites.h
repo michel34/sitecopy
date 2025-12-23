@@ -340,6 +340,13 @@ struct site_host {
     char *password;
 };
 
+typedef enum{
+    FTP_SSL_NEVER=0,    // do not use FTPS
+    FTP_SSL_TRY=1,      // use FTPS if possible
+    FTP_SSL_ALWAYS=2,   // require FTPS
+    FTP_SSL_IMPLICIT=3  // directly connect in SSL (implicit FTPS: usually on port 990)
+}ftp_ssl_config_enum;
+
 /* This represents a site */
 struct site {
 
@@ -377,6 +384,7 @@ struct site {
     unsigned int ftp_echo_quit;
     unsigned int ftp_forcecd;
     unsigned int ftp_use_cwd;
+    ftp_ssl_config_enum ftp_ssl_config;	
     unsigned int http_use_expect;
     unsigned int http_limit;
     unsigned int http_secure;

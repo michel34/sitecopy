@@ -68,6 +68,7 @@ int ftp_open(ftp_session *sess); /* Performs the login procedure */
 int ftp_set_server(ftp_session *sess, struct site_host *server);
 void ftp_set_passive(ftp_session *sess, int use_passive);
 void ftp_set_usecwd(ftp_session *sess, int use_cwd);
+void ftp_set_site(ftp_session *sess, struct site *site);
 
 const char *ftp_get_error(ftp_session *sess);
 int ftp_finish(ftp_session *sess);

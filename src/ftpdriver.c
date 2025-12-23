@@ -43,13 +43,14 @@ static int f2s(int errcode)
 
 static int get_server_port(struct site *site)
 {
-    return 21;
+    return site->ftp_ssl_config == FTP_SSL_IMPLICIT ? 990 : 21;
 }
 
 static int init(void **session, struct site *site) 
 {
     int ret;
     ftp_session *sess = ftp_init();
+	ftp_set_site(sess, site);
     ret = ftp_set_server(sess, &site->server);
     if (ret == FTP_OK) {
 	if (site->ftp_pasv_mode) {

@@ -120,6 +120,11 @@ struct ftp_session_s {
 
     /* Error string */
     char error[BUFSIZ];
+
+    // information for FTPS
+    struct site *site;
+    unsigned int use_ssl_pi; // whether SSL is used for command port
+    unsigned int use_ssl_dtp; // whether SSL is used for data port
 };
 
 #define FTP_ERR(x) do { \
@@ -326,6 +331,7 @@ static int parse_reply(ftp_session *sess, int code, char *reply)
     case 200: /* misc OK codes */
     case 220:
     case 230:
+    case 234: /* AUTH TLS OK */
     case 250: /* completed file action */
     case 253: /* delete successful */
     case 257: /* mkdir success */
@@ -525,6 +531,74 @@ static int receive_file(ftp_session *sess, FILE *f)
     return 0;
 }
 
+//TODO: this part must be finished / improved
+#ifdef NE_HAVE_SSL
+/* Callback invoked when SSL server cert verification fails. */
+static int verify_certificate(void *userdata, int failures,
+                              const ne_ssl_certificate *cert)
+{
+    struct site *site = userdata;
+
+    if (fe_accept_cert(cert, failures)) {
+        /* Not accepted by user => fail verification. */
+        return -1;
+    }
+
+    if (ne_ssl_cert_write(cert, site->certfile)) {
+        fe_warning(_("Could not write SSL certificate"),
+                   NULL, site->certfile);
+    }
+
+    return 0;
+}
+
+// start SSL link on PI or DTP socket
+static int ftp_ssl_start(ftp_session *sess, ne_socket *sock)
+{
+    ne_ssl_context *ctx = ne_ssl_context_create(NE_SSL_CTX_CLIENT);
+    if (!ctx)
+    {
+        NE_DEBUG(DEBUG_FTP, "Failed ne_ssl_context_create(NE_SSL_CTX_CLIENT).\n");
+        ne_sock_close(sock);
+        return FTP_CONNECT;
+    }
+    //TODO: ne_sock_connect_ssl() requires a ne_session* as 3rd argument, so we create one
+    NE_DEBUG(DEBUG_FTP, "Creating empty ne_session object for FTPS.\n");
+    ne_session* ne_sess = ne_session_create("https", sess->hostname,  (sock == sess->pisock ? sess->pi_port : sess->dtp_port));
+    if (!ne_sess)
+    {
+        NE_DEBUG(DEBUG_FTP, "Could not create ne_session object.\n");
+        ne_sock_close(sock);
+        return FTP_CONNECT;
+    }
+    int ret = ne_sock_connect_ssl(sock, ctx, ne_sess);
+    if (ret != NE_OK)
+    {
+        NE_DEBUG(DEBUG_FTP, "Failed ne_sock_connect_ssl().\n");
+        ne_sock_close(sock);
+        return FTP_CONNECT;
+    }
+
+    //check client certificate
+    if (access(sess->site->certfile, R_OK) == 0) {
+        sess->site->server_cert = ne_ssl_cert_read(sess->site->certfile);
+        if (sess->site->server_cert == NULL) {
+            ne_set_error(ne_sess, _("Could not load certificate `%s'."),
+                         sess->site->certfile);
+            ne_sock_close(sock);
+            return FTP_CONNECT;
+        }
+    }
+    else {
+        ne_ssl_trust_default_ca(ne_sess);
+    }
+    ne_ssl_set_verify(ne_sess, verify_certificate, sess->site);
+
+
+    return FTP_OK;
+}
+#endif NE_HAVE_SSL
+
 /* Passively (client-connects) open the DTP socket ; return non-zero
  * on success. */
 static int dtp_open_passive(ftp_session *sess) 
@@ -538,6 +612,19 @@ static int dtp_open_passive(ftp_session *sess)
         ne_sock_close(sess->dtpsock);
 	return 0;
     } else {
+    //TODO: if DATA-SSL, open SSL on passive data socket
+#ifdef NE_HAVE_SSL
+    if(sess->use_ssl_dtp)
+    {
+        NE_DEBUG(DEBUG_FTP, "Starting SSL negociation on passive data port.\n");
+        ret = ftp_ssl_start(sess, sess->dtpsock);
+        if (ret!=FTP_OK)
+        {
+            NE_DEBUG(DEBUG_FTP, "SSL negociation on passive data port failed.\n");
+            return 0;
+        }
+    }
+#endif NE_HAVE_SSL
 	return 1;
     }
 }
@@ -562,6 +649,11 @@ void ftp_set_passive(ftp_session *sess, int use_passive)
 void ftp_set_usecwd(ftp_session *sess, int use_cwd) 
 {
     sess->use_cwd = use_cwd;
+}
+
+void ftp_set_site(ftp_session *sess, struct site *site)
+{
+    sess->site = site;
 }
 
 int ftp_set_server(ftp_session *sess, struct site_host *server)
@@ -660,7 +752,8 @@ static int dtp_open_active(ftp_session *sess, const char *command)
         return FTP_ERROR;
     }
 
-    /* Let the kernel choose a port */
+    //TODO: check that it is OK not to use default port for active data link (20 for FTP, 989 for implicit FTPS)
+	/* Let the kernel choose a port */
     addr.sin_port = 0;
  
     /* Create a local socket to accept the connection on */
@@ -740,6 +833,19 @@ static int dtp_open_active(ftp_session *sess, const char *command)
             ne_sock_close(sess->dtpsock);
 	    ret = FTP_ERROR;
 	}
+    }	
+    //TODO: if DATA-SSL, open SSL on active data socket
+    //TODO: must be checked, could not try on an FTP server supporting active mode (commands PORT and EPRT are rejected, Filezilla switch to passive mode even if configured for active)
+    //TODO: FIXME? active mode does not support IPv6 (EPRT command not implemented; EPSV also not implemented but maybe not needed)
+    if(sess->use_ssl_dtp)
+    {
+        NE_DEBUG(DEBUG_FTP, "Starting SSL negociation on active data port.\n");
+        ret = ftp_ssl_start(sess, sess->dtpsock);
+        if (ret!=FTP_OK)
+        {
+            NE_DEBUG(DEBUG_FTP, "SSL negociation on passive active port failed.\n");
+            return 0;
+        }
     }
 
     (void) close(listener);
@@ -1083,7 +1189,19 @@ int ftp_open(ftp_session *sess)
 
     fe_connection(fe_connected, NULL);
 
-    /* Read the hello message */
+    if (sess->site->ftp_ssl_config == FTP_SSL_IMPLICIT)
+    {
+        NE_DEBUG(DEBUG_FTP, "Starting SSL negociation for PI socket in implicit FTPS.\n");
+        ret = ftp_ssl_start(sess, sess->pisock);
+        if (ret != FTP_OK)
+        {
+            NE_DEBUG(DEBUG_FTP, "SSL negociation failed, stopping.\n");
+            ne_sock_close(sess->pisock);
+            return FTP_FAILED;
+        }
+    }
+
+	/* Read the hello message */
     ret = read_reply(sess, &code, sess->rbuf, sizeof sess->rbuf);
     if (ret != FTP_OK) return FTP_HELLO;
 
@@ -1093,6 +1211,85 @@ int ftp_open(ftp_session *sess)
         return FTP_HELLO;
     }
 
+    // switch to TLS is appropriate
+    sess->use_ssl_pi = (sess->site->ftp_ssl_config == FTP_SSL_IMPLICIT); // not yet using SSL, except in implicit mode
+    if (sess->site->ftp_ssl_config == FTP_SSL_TRY || sess->site->ftp_ssl_config == FTP_SSL_ALWAYS)
+    {
+        sess->use_ssl_pi = 1; // trying to use SSL
+        NE_DEBUG(DEBUG_FTP, "Trying to enable TLS.\n");
+        if ((ret=run_command(sess, "AUTH TLS")) != FTP_OK)
+        {
+            NE_DEBUG(DEBUG_FTP, "AUTH TLS failed.\n");
+            if (ret==FTP_BROKEN)
+                return FTP_ERROR;
+            NE_DEBUG(DEBUG_FTP, "Trying to enable SSL.\n");
+            if ((ret=run_command(sess, "AUTH SSL")) != FTP_OK)
+            {
+                NE_DEBUG(DEBUG_FTP, "AUTH SSL failed.\n");
+                if (ret==FTP_BROKEN)
+                    return FTP_ERROR;
+                sess->use_ssl_pi = 0; // SSL not used
+                if (sess->site->ftp_ssl_config == FTP_SSL_TRY) // not required, continue with warning
+                    NE_DEBUG(DEBUG_FTP, "Could not enable TLS or SSL, continuing without cyphering.\n");
+                else
+                {
+                    NE_DEBUG(DEBUG_FTP, "Could not enable TLS or SSL, stopping.\n");
+                    ne_sock_close(sess->pisock);
+                    return FTP_FAILED;
+                }
+            }
+        }
+    }
+
+    if (sess->use_ssl_pi && sess->site->ftp_ssl_config != FTP_SSL_IMPLICIT)
+    {
+        NE_DEBUG(DEBUG_FTP, "Starting SSL negociation for PI socket.\n");
+        ret = ftp_ssl_start(sess, sess->pisock);
+        if (ret != FTP_OK)
+        {
+            NE_DEBUG(DEBUG_FTP, "SSL negociation failed, stopping.\n");
+            if (ret==FTP_BROKEN)
+                return FTP_ERROR;
+            ne_sock_close(sess->pisock);
+            return FTP_FAILED;
+        }
+    }
+
+    // enable SSL on data port, when used on command port (accept not to enable it in mode "TRY")
+    if (sess->use_ssl_pi)//TODO:remove
+    {
+        NE_DEBUG(DEBUG_FTP, "Trying to enable TLS on data port (PBSZ 0, PROT P).\n");
+        sess->use_ssl_dtp = 1; // trying to use SSL on data port
+        if ((ret = run_command(sess, "PBSZ 0")) != FTP_OK)
+        {
+            sess->use_ssl_dtp = 0;
+            NE_DEBUG(DEBUG_FTP, "PBSZ failed.\n");
+            if (ret == FTP_BROKEN)
+                return FTP_ERROR;
+        }
+        if (sess->use_ssl_dtp)
+        {
+            if ((ret = run_command(sess, "PROT P")) != FTP_OK)
+            {
+                sess->use_ssl_dtp = 0;
+                NE_DEBUG(DEBUG_FTP, "PROT P failed.\n");
+                if (ret == FTP_BROKEN)
+                    return FTP_ERROR;
+            }
+        }
+        if (!sess->use_ssl_dtp)
+        {
+            if (sess->site->ftp_ssl_config == FTP_SSL_TRY)
+                NE_DEBUG(DEBUG_FTP, "Continuing without cyphering data transfer.\n");
+            else
+            {
+                NE_DEBUG(DEBUG_FTP, "Cannot cypher data transfer, stopping.\n");
+                ne_sock_close(sess->pisock);
+                return FTP_CONNECT;
+            }
+        }
+    }
+	
     if (authenticate(sess) != FTP_OK) {
         if (sess->connected) {
             ne_sock_close(sess->pisock);

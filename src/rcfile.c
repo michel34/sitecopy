@@ -114,6 +114,7 @@ int rcfile_read(struct site **sites)
 
     default_site.ftp_pasv_mode = true;
     default_site.ftp_use_cwd = false;
+	default_site.ftp_ssl_config = ne_has_support(NE_FEATURE_SSL) ? FTP_SSL_TRY : FTP_SSL_NEVER; // Default: use FTPS if possible (and compiled in)
     
     last_site = this_site = NULL;
     rcfile_linenum = 0;
@@ -412,9 +413,22 @@ int rcfile_read(struct site **sites)
 		    this_site->ftp_use_cwd = true;		    
 		} else if (strcmp(val, "nousecwd") == 0) {
 		    this_site->ftp_use_cwd = false;		    
-		} else {
+		} else if (strcmp(val, "ssl_never") == 0) {
+		    this_site->ftp_ssl_config = FTP_SSL_NEVER;
+		} else if (strcmp(val, "ssl_try") == 0) {
+		    this_site->ftp_ssl_config = FTP_SSL_TRY;
+		} else if (strcmp(val, "ssl_always") == 0) {
+		    this_site->ftp_ssl_config = FTP_SSL_ALWAYS;
+		} else if (strcmp(val, "ssl_implicit") == 0) {
+		    this_site->ftp_ssl_config = FTP_SSL_IMPLICIT;
+		} else {	
 		    ret = RC_CORRUPT;
 		}
+		if (this_site->ftp_ssl_config != FTP_SSL_NEVER && !ne_has_support(NE_FEATURE_SSL))
+		{
+            NE_DEBUG(DEBUG_RCFILE, "Cannot set 'ftp %s' because SSL feature not supported\n", val);
+            ret = RC_CORRUPT; // requested to use SSL but SSL not supported
+        }
 	    } else if (strcmp(key, "http") == 0) {
 		if (strcmp(val, "expect") == 0) {
 		    this_site->http_use_expect = true;
@@ -788,6 +802,12 @@ int rcfile_write (char *filename, struct site *list_of_sites)
 	RCWRITEBOOL(!current->ftp_pasv_mode, "ftp nopasv");
 	RCWRITEBOOL(current->ftp_echo_quit, "ftp showquit");
 	RCWRITEBOOL(current->ftp_use_cwd, "ftp usecwd");
+	if (ne_has_support(NE_FEATURE_SSL)){
+	  RCWRITEBOOL(current->ftp_ssl_config==FTP_SSL_NEVER, "ftp ssl_never");
+	  // FTP_SSL_TRY is default when SSL is enabled: do not store it
+	  RCWRITEBOOL(current->ftp_ssl_config==FTP_SSL_ALWAYS, "ftp ssl_always");
+	  RCWRITEBOOL(current->ftp_ssl_config==FTP_SSL_IMPLICIT, "ftp ssl_implicit");
+	}
 	RCWRITEBOOL(current->http_limit, "http limit");
 	RCWRITEBOOL(current->http_use_expect, "http expect");
 	
